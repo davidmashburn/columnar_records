@@ -13,9 +13,10 @@ setup(
     scripts=[],
     url='http://pypi.python.org/pypi/columnar_records/',
     license='LICENSE.txt',
-    description='<ADD DESCRIPTION>',
-    long_description=open('README.txt').read(),
+    description='A dataframe-like object but simpler (basically a list of numpy arrays on steroids)',
+    long_description=open('README.md').read(),
     install_requires=[
-                      
+                      'numpy>=1.0',
+                      'future>=0.16',
                      ],
 )
