@@ -8,6 +8,10 @@ from itertools import chain, islice
 
 import numpy as np
 
+def islistlike(x):
+    '''Test if something is an iterable but NOT as string'''
+    return hasattr(x, '__iter__') and not isinstance(x, str)
+
 def assertSameAndCondense(l, message='List values differ!'):
     '''Take a list of values that should all be the same, assert that this is true,
        and then return the common value
@@ -131,3 +135,12 @@ def get_index_groups(arr):
     inv[sort_ind] = sorted_key_inds
     index_groups = split_at_boundaries(np.argsort(inv), split_points)
     return keys, index_groups
+
+def _group_transform(arr, index_groups, fun, result_dtype):
+    '''Helper function for group_transform
+       Apply fun to each subgroup in arr, using index_groups
+       Return the results in place in a new array'''
+    result = np.empty(len(arr), dtype=result_dtype)
+    for g in index_groups:
+        result[g] = fun(arr[g])
+    return result

@@ -26,7 +26,8 @@ from functools import reduce
 
 import numpy as np
 
-from .utils import assertSameAndCondense, index_helper, get_index_groups, split_at_boundaries
+from . import utils
+from .utils import _group_transform
 
 REPR_STR = '''ColumnarRecords([
   {}
@@ -75,6 +76,13 @@ def le(a, b):
 def ge(a, b):
     return _comp(a, b, np.ndarray.__ge__)
 
+def join(*colrec_list):
+    '''Join two or more ColumnarObjects together'''
+    return ColumnarRecords([arr for c in colrec_list
+                                for arr in c.arrays],
+                           [name for c in colrec_list
+                                 for name in c.names])
+
 def _has_records(x):
     return isinstance(x, np.ndarray) and x.dtype.names is not None
 
@@ -97,9 +105,9 @@ class ColumnarRecords(object):
         for arr in arrays:
             assert arr.dtype.names is None, 'Arrays must not be records!'
         
-        self.num_arrays = assertSameAndCondense([len(i) for i in [arrays, dtypes, names]])
-        self.shape = assertSameAndCondense([arr.shape for arr in arrays])
-        self.size = assertSameAndCondense([arr.size for arr in arrays])
+        self.ncols = utils.assertSameAndCondense([len(i) for i in [arrays, dtypes, names]])
+        self.shape = utils.assertSameAndCondense([arr.shape for arr in arrays])
+        self.size = utils.assertSameAndCondense([arr.size for arr in arrays])
         self.length = 0 if not len(self.shape) else self.shape[0]
         
         self.arrays = arrays
@@ -125,7 +133,7 @@ class ColumnarRecords(object):
     def _names_match(self, x):
         x = as_cr(x)
         
-        if self.num_arrays != x.num_arrays:
+        if self.ncols != x.ncols:
             return False
         
         if any([i!=j for i, j in zip(self.names, x.names)]):
@@ -205,9 +213,6 @@ class ColumnarRecords(object):
     def __le__(self, x):
         return le(self, x)
     
-    def __len__(self):
-        return self.length
-    
     def __iter__(self):
         return (tuple([arr[i] for arr in self.arrays])
                 for i in range(self.size))
@@ -254,6 +259,16 @@ class ColumnarRecords(object):
         for arr, y_arr in zip(self.arrays, y.arrays):
             arr.__setslice__(i, j, y_arr)
     
+    def group_count(self, use_argsort=False):
+        '''Get the count of all the groups in the array
+           This is much faster than what could be acheived using the tools below,
+           i.e. map(len, get_index_groups(arr)[0])'''
+        rav = self[names].ravel()
+        sort_rav = rav.sort()
+        isdiff, keys, split_points = utils.index_helper(rav, sort_rav)
+        counts = np.diff(np.concatenate((split_points, [rav.size])))
+        return keys, counts
+    
     def get_index_groups(self, names=None):
         if names is None:
             names = self.names
@@ -265,12 +280,82 @@ class ColumnarRecords(object):
         sort_ind = rav.argsort()
         sort_rav = rav[sort_ind]
         b = sort_rav[1:] != sort_rav[:-1]
-        isdiff, keys, split_points = index_helper(rav, sort_rav)
+        isdiff, keys, split_points = utils.index_helper(rav, sort_rav)
         sorted_key_inds = np.cumsum(isdiff) - 1
         inv = np.empty(rav.shape, dtype=np.intp)
         inv[sort_ind] = sorted_key_inds
-        index_groups = split_at_boundaries(np.argsort(inv), split_points)
+        index_groups = utils.split_at_boundaries(np.argsort(inv), split_points)
         return keys, index_groups
+    
+    def groupby(self, keynames, *fun_fields_name):
+        '''Clone of np_utils.rec_groupby for a CR
+           
+           Docs for np_utils.rec_groupby:
+           A special version of np_groupby for record arrays, somewhat similar
+           to the function found in matplotlib.mlab.rec_groupby.
+           
+           This is basically a wrapper around np_groupy that automatically
+           generates lambda's like the ones in the np_groupby doc string.
+           That same call would look like this using rec_grouby:
+           
+           rec_groupby(a, ['m', 'n'], (np.mean, 'o', 'mean_o'),
+                                      (np.std, 'o', 'std_o'),
+                                      (np.min, 'p', 'min_p'))
+           and the second function could be written as:
+               def compute_some_thing(x):
+                   o, p = x['o'], x['p']
+                   return np.mean(o) / np.std(o) * np.min(p)
+               rec_groupby(a, ['m', 'n'],
+                           (compute_some_thing, ['o', 'p'], 'its_complicated'))
+           
+           In general, this function is faster than matplotlib.mlab, but not
+           as fast as pandas and probably misses some corner cases for each :)
+           '''
+        
+        keynames = list(keynames) if utils.islistlike(keynames) else [keynames]
+        keys, index_groups = self.get_index_groups(keynames)
+        new_names = [i[-1] for i in fun_fields_name]
+        groups = ColumnarRecords([np.fromiter((fun(self[fields][i]) for i in index_groups),
+                                              dtype=None, count=len(keys))
+                                  for fun, fields, name in fun_fields_name],
+                                 names=new_names)
+        return join(keys, groups)
+    
+    def groupby_full(self, keynames, *fun_dtype_fields_name):
+        '''Clone of np_utils.rec_groupby_full for a CR
+           
+           Docs for np_utils.rec_groupby_full:
+           A special version of np_groupby for record arrays, somewhat similar
+           to the function found in matplotlib.mlab.rec_groupby.
+           
+           This is basically a wrapper around np_groupy_full that automatically
+           generates lambda's like the ones in the np_groupby_full doc string.
+           That same call would look like this using rec_grouby_full:
+           
+           simple_rank = lambda x: np.argsort(x) + 1
+           background_subtract = lambda x: x - x.mean()
+           simple_normalize = lambda x: x / x.mean()
+           
+           rec_groupby_full(a, ['m', 'n'],
+               (simple_rank,         np.int,   'o',        'rank_o'),
+               (simple_rank,         np.int,   ['o', 'p'], 'rank_op'),
+               (background_subtract, np.float, 'o',        'bg_sub_o'),
+               (simple_normalize,    np.float, 'p',        'norm_p')
+           )
+           
+           
+           In general, this function is faster than matplotlib.mlab, but not
+           as fast as pandas and probably misses some corner cases for each :)
+           '''
+        
+        keynames = list(keynames) if utils.islistlike(keynames) else [keynames]
+        key_cr = self[keynames].ravel()
+        keys, index_groups = key_cr.get_index_groups()
+        new_names = [i[-1] for i in fun_dtype_fields_name]
+        groups = ColumnarRecords([_group_transform(self[fields], index_groups, fun, dtype)
+                                  for fun, dtype, fields, name in fun_dtype_fields_name],
+                                 names=new_names)
+        return join(key_cr, groups)
     
     def tolist(self):
         return [arr.tolist() for arr in self.arrays]
@@ -313,29 +398,44 @@ def from_records(records, names=None, dtypes=None):
     if dtypes is None:
         dtypes = [None] * n_arrays
     
-    arrays = [np.array([r[i]
-                        for r in records], dtype=dtypes[i])
+    count = len(records)
+    arrays = [(np.array([r[i] for r in records],
+                        dtype=dtypes[i])
+               if dtypes[i] is None or np.dtype(dtypes[i]) == np.object else
+               np.fromiter((r[i] for r in records),
+                           dtype=dtypes[i], count=count)
+              )
               for i in range(n_arrays)]
     return ColumnarRecords(arrays, names=names)
 
+def from_iter(record_iterator, names, dtypes, count):
+    '''Create a ColumnarRecords from a record iterator;
+       operates without any intermediate memory, but may be slower
+       than from_records (this uses a double python for loop).
+       
+       names, dtypes, and counts MUST be supplied,
+       otherwise from_records should be used.'''
+    
+    arrays = [np.empty(count, dtype=dtype)
+              for dtype in dtypes]
+    
+    for i, r in enumerate(record_iterator):
+        for j, rr in enumerate(r):
+            arrays[j][i] = rr
+    
+    return ColumnarRecords(arrays, names=names)
+
 def as_cr(x):
+    '''Construct a ColumnarRecords object from:
+       * another ColumnarRecords
+       * a numpy record array
+       * a list of arrays'''
+    
     return (x if isinstance(x, ColumnarRecords) else
             from_recarray(x) if _has_records(x) else
             ColumnarRecords(x))
 
-if __name__ == '__main__':
-    # Example CR's:
-    L1 = [[1,2,3,4], ['a', 'b', 'c', 'd']]
-    cr = ColumnarRecords(L1)
-    print(cr)
-    
-    L2 = [[1,2,3,4], ['d', 'c', 'b', 'a']]
-    N2 = ['numbers', 'letters']
-    cr2 = ColumnarRecords(L2, names=N2)
-    print(cr2)
-    
-    L3 = [[1, 1, 2, 2, 3, 3, 4, 4, 4],
-         ['a', 'b', 'c', 'a', 'b', 'c', 'a', 'b', 'c'],
-         [float(i) / 9 for i in range(9)]]
-    cr3 = ColumnarRecords(L3, names=['i', 'a', 'f'])
-    print(cr3)
+argsort = ColumnarRecords.argsort
+sort = ColumnarRecords.sort
+groupby = ColumnarRecords.groupby
+groupby_full = ColumnarRecords.groupby_full
